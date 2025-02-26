@@ -59,6 +59,7 @@ def process_lead(image, bbox):
     """
     Process a lead from the ECG image and extract its signal.
     """
+    import cv2
     # Extract ROI
     height, width = image.shape[:2]
     x1 = max(0, int(bbox['x1'] * width))
