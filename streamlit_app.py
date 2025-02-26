@@ -6,217 +6,18 @@ import cv2
 import torch
 import matplotlib.pyplot as plt
 import tempfile
-import sys
 from PIL import Image
-
-# Add import for YOLO model
 from ultralytics import YOLO
-from additional_func import *
+from additional_func import (map_to_lead_names, CNNLSTMModel, normalize_signal,
+                            resample_to_ptb_xl_format)
 
-# Import functions from the original script
-# In a real application, you would import these from a separate module
-# For this example, we'll include the necessary functions directly
-
-def map_to_lead_names(detections):
-    """Map YOLO class IDs to ECG lead names"""
-    lead_mapping = [
-        {'yolo_class_id': 0, 'lead_name': 'I'},
-        {'yolo_class_id': 3, 'lead_name': 'aVR'},
-        {'yolo_class_id': 6, 'lead_name': 'V1'},
-        {'yolo_class_id': 9, 'lead_name': 'V4'},
-        {'yolo_class_id': 1, 'lead_name': 'II'},
-        {'yolo_class_id': 4, 'lead_name': 'aVL'},
-        {'yolo_class_id': 7, 'lead_name': 'V2'},
-        {'yolo_class_id': 10, 'lead_name': 'V5'},
-        {'yolo_class_id': 2, 'lead_name': 'III'},
-        {'yolo_class_id': 5, 'lead_name': 'aVF'},
-        {'yolo_class_id': 8, 'lead_name': 'V3'},
-        {'yolo_class_id': 11, 'lead_name': 'V6'},
-    ]
-    
-    leads_by_class_id = {item['yolo_class_id']: item['lead_name'] for item in lead_mapping}
-    
-    mapped_boxes = []
-    for box in detections:
-        box_copy = box.copy()
-        box_copy['lead_name'] = leads_by_class_id.get(box['class_id'], 'Unknown')
-        mapped_boxes.append(box_copy)
-    
-    return mapped_boxes
-
-# Define model classes
-class TransformerBlock(torch.nn.Module):
-    """Transformer block with multi-head attention and feed-forward network."""
-    
-    def __init__(self, embed_dim, num_heads, ff_dim, dropout=0.1):
-        super(TransformerBlock, self).__init__()
-        self.attention = torch.nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
-        self.norm1 = torch.nn.LayerNorm(embed_dim)
-        self.norm2 = torch.nn.LayerNorm(embed_dim)
-        self.ff = torch.nn.Sequential(
-            torch.nn.Linear(embed_dim, ff_dim),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(dropout),
-            torch.nn.Linear(ff_dim, embed_dim)
-        )
-        self.dropout = torch.nn.Dropout(dropout)
-        
-    def forward(self, x):
-        # Self-attention
-        attn_output, _ = self.attention(x, x, x)
-        x = x + self.dropout(attn_output)
-        x = self.norm1(x)
-        
-        # Feed-forward network
-        ff_output = self.ff(x)
-        x = x + self.dropout(ff_output)
-        x = self.norm2(x)
-        
-        return x
-
-class TransformerModel(torch.nn.Module):
-    """Transformer model for ECG classification."""
-    
-    def __init__(self, sequence_length=1000, num_leads=12, embed_dim=64, num_heads=8, 
-                 ff_dim=128, num_transformer_blocks=4, dropout=0.2):
-        super(TransformerModel, self).__init__()
-        
-        # Initial projection
-        self.projection = torch.nn.Sequential(
-            torch.nn.Conv1d(num_leads, embed_dim, kernel_size=5, stride=2, padding=2),
-            torch.nn.BatchNorm1d(embed_dim),
-            torch.nn.ReLU(),
-            torch.nn.MaxPool1d(kernel_size=2, stride=2)
-        )
-        
-        # Calculate sequence length after projection
-        projected_seq_len = sequence_length // 4  # After Conv1d with stride=2 and MaxPool1d with stride=2
-        
-        # Transformer blocks
-        self.transformer_blocks = torch.nn.ModuleList([
-            TransformerBlock(embed_dim, num_heads, ff_dim, dropout)
-            for _ in range(num_transformer_blocks)
-        ])
-        
-        # Classification head
-        self.classifier = torch.nn.Sequential(
-            torch.nn.Linear(embed_dim, 64),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(0.3),
-            torch.nn.Linear(64, 1),
-            torch.nn.Sigmoid()
-        )
-        
-    def forward(self, x):
-        # x shape: [batch_size, sequence_length, num_leads]
-        # Transpose for 1D convolution [batch_size, num_leads, sequence_length]
-        x = x.transpose(1, 2)
-        
-        # Apply initial projection
-        x = self.projection(x)
-        
-        # Transpose back for transformer [batch_size, sequence_length, embed_dim]
-        x = x.transpose(1, 2)
-        
-        # Apply transformer blocks
-        for block in self.transformer_blocks:
-            x = block(x)
-            
-        # Global average pooling
-        x = torch.mean(x, dim=1)
-        
-        # Classification
-        x = self.classifier(x)
-        
-        return x
-
-class CNNLSTMModel(torch.nn.Module):
-    """CNN-LSTM hybrid model for ECG classification."""
-    
-    def __init__(self, sequence_length=1000, num_leads=12, dropout=0.3):
-        super(CNNLSTMModel, self).__init__()
-        
-        # CNN feature extraction
-        self.cnn_layers = torch.nn.Sequential(
-            # First CNN block
-            torch.nn.Conv1d(num_leads, 64, kernel_size=5, stride=1, padding=2),
-            torch.nn.BatchNorm1d(64),
-            torch.nn.ReLU(),
-            torch.nn.MaxPool1d(kernel_size=2, stride=2),
-            
-            # Second CNN block
-            torch.nn.Conv1d(64, 128, kernel_size=5, stride=1, padding=2),
-            torch.nn.BatchNorm1d(128),
-            torch.nn.ReLU(),
-            torch.nn.MaxPool1d(kernel_size=2, stride=2),
-            
-            # Third CNN block
-            torch.nn.Conv1d(128, 256, kernel_size=3, stride=1, padding=1),
-            torch.nn.BatchNorm1d(256),
-            torch.nn.ReLU(),
-            torch.nn.MaxPool1d(kernel_size=2, stride=2)
-        )
-        
-        # Calculate sequence length after CNN layers
-        self.lstm_input_size = 256
-        self.lstm_hidden_size = 128
-        self.lstm_seq_len = sequence_length // 8  # After 3 MaxPool layers with stride=2
-        
-        # Bidirectional LSTM layers
-        self.lstm_layers = torch.nn.Sequential(
-            torch.nn.LSTM(input_size=self.lstm_input_size,
-                    hidden_size=self.lstm_hidden_size,
-                    num_layers=2,
-                    dropout=dropout,
-                    bidirectional=True,
-                    batch_first=True)
-        )
-        
-        # Classification head
-        self.classifier = torch.nn.Sequential(
-            torch.nn.Linear(self.lstm_hidden_size * 2, 64),  # * 2 for bidirectional
-            torch.nn.ReLU(),
-            torch.nn.Dropout(0.2),
-            torch.nn.Linear(64, 1),
-            torch.nn.Sigmoid()
-        )
-        
-    def forward(self, x):
-        # x shape: [batch_size, sequence_length, num_leads]
-        batch_size = x.shape[0]
-        
-        # Transpose for 1D convolution [batch_size, num_leads, sequence_length]
-        x = x.transpose(1, 2)
-        
-        # Apply CNN layers
-        x = self.cnn_layers(x)
-        
-        # Transpose back for LSTM [batch_size, sequence_length, features]
-        x = x.transpose(1, 2)
-        
-        # Apply LSTM layers
-        lstm_out, (h_n, c_n) = self.lstm_layers[0](x)
-        
-        # Get the final hidden state from both directions
-        h_n = h_n.view(2, 2, batch_size, self.lstm_hidden_size)  # [num_layers, num_directions, batch_size, hidden_size]
-        final_hidden = torch.cat((h_n[-1, 0, :, :], h_n[-1, 1, :, :]), dim=1)
-        
-        # Classification
-        x = self.classifier(final_hidden)
-        
-        return x
+# Set fixed paths for models
+YOLO_MODEL_PATH = "models/yolo_ecg_model.pt"  # Update with your actual fixed path
+ML_MODEL_PATH = "models/cnn_lstm_model.pt"    # Update with your actual fixed path
 
 def detect_ecg_leads(image_data, yolo_model, conf_threshold=0.25):
     """
     Detect ECG leads using YOLOv8 model.
-    
-    Args:
-        image_data: Image data (numpy array)
-        yolo_model: Loaded YOLOv8 model
-        conf_threshold: Confidence threshold for detections
-        
-    Returns:
-        List of dictionaries with detected lead information
     """
     # Run detection
     results = yolo_model(image_data, conf=conf_threshold)
@@ -257,15 +58,7 @@ def detect_ecg_leads(image_data, yolo_model, conf_threshold=0.25):
 def process_lead(image, bbox):
     """
     Process a lead from the ECG image and extract its signal.
-    
-    Args:
-        image: ECG image
-        bbox: Bounding box information for the lead
-        
-    Returns:
-        List of (x, y) points representing the signal
     """
-    import cv2
     # Extract ROI
     height, width = image.shape[:2]
     x1 = max(0, int(bbox['x1'] * width))
@@ -369,13 +162,6 @@ def process_lead(image, bbox):
 def extract_ecg_signals(image, detections):
     """
     Extract ECG signals from an image using YOLOv8 detections.
-    
-    Args:
-        image: ECG image
-        detections: List of detected bounding boxes
-    
-    Returns:
-        Dictionary with lead signals
     """
     # Map class IDs to lead names
     mapped_boxes = map_to_lead_names(detections)
@@ -395,112 +181,14 @@ def extract_ecg_signals(image, detections):
     
     return lead_signals
 
-def resample_to_ptb_xl_format(lead_signals, target_fs=100, record_id='record'):
+def load_model(model_path, device=None):
     """
-    Resample the extracted ECG signals to PTB-XL format (100Hz).
-    
-    Args:
-        lead_signals: Dictionary of lead name to signal points
-        target_fs: Target sampling frequency (100Hz for PTB-XL)
-        record_id: Record ID for the output file
-        
-    Returns:
-        Resampled signals in PTB-XL format
-    """
-    # Standard lead order in PTB-XL
-    ptb_xl_leads = ['I', 'II', 'III', 'aVR', 'aVL', 'aVF', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6']
-    
-    # Estimate original sampling rate based on signal length
-    # Assuming 10 seconds recording like PTB-XL standard
-    signal_lengths = [len(lead_signals.get(lead, [])) for lead in ptb_xl_leads if lead in lead_signals]
-    if not signal_lengths:
-        raise ValueError("No valid signals found")
-        
-    # Estimate original sampling rate (points per second)
-    orig_fs = max(signal_lengths) / 10  # Assuming 10 second recording
-    
-    # Prepare resampled signals
-    resampled_signals = []
-    
-    for lead in ptb_xl_leads:
-        if lead in lead_signals and lead_signals[lead]:
-            # Extract x and y values
-            x_values = np.array([p[0] for p in lead_signals[lead]])
-            y_values = np.array([p[1] for p in lead_signals[lead]])
-            
-            # Invert y-values (since image coordinates have origin at top-left)
-            y_values = -y_values
-            
-            # Center around zero by subtracting the median
-            y_values = y_values - np.median(y_values)
-            
-            # Create a time array based on x_values
-            orig_times = x_values / orig_fs
-            
-            # Create a new time array for target sampling rate
-            num_samples = int(10 * target_fs)  # 10 seconds at target_fs
-            new_times = np.linspace(0, 10, num_samples)
-            
-            # Resample signal using interpolation
-            if len(orig_times) > 1:
-                resampled = np.interp(new_times, orig_times, y_values)
-            else:
-                # Handle empty or single-point signal
-                resampled = np.zeros(num_samples)
-        else:
-            # Create an empty signal if lead not found
-            resampled = np.zeros(int(10 * target_fs))
-        
-        resampled_signals.append(resampled)
-    
-    # Convert list of arrays to 2D numpy array (samples × leads)
-    signals = np.column_stack(resampled_signals)
-    
-    return signals, target_fs
-
-def normalize_signal(signal):
-    """
-    Normalize ECG signal lead-wise.
-    
-    Args:
-        signal (numpy.ndarray): ECG signal with shape (sequence_length, 12)
-        
-    Returns:
-        numpy.ndarray: Normalized ECG signal
-    """
-    normalized = np.zeros_like(signal)
-    
-    for i in range(signal.shape[1]):  # For each lead
-        lead_data = signal[:, i]
-        mean = np.mean(lead_data)
-        std = np.std(lead_data)
-        # Avoid division by zero
-        normalized[:, i] = (lead_data - mean) / (std if std > 0 else 1)
-        
-    return normalized
-
-def load_model(model_path, model_type="transformer", device=None):
-    """
-    Load a trained model from a checkpoint file.
-    
-    Args:
-        model_path (str): Path to the model checkpoint
-        model_type (str): Type of model ("transformer" or "cnn_lstm")
-        device (torch.device): Device to load the model on
-        
-    Returns:
-        torch.nn.Module: Loaded model
+    Load the CNN-LSTM model.
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    if model_type.lower() == "transformer":
-        model = TransformerModel(sequence_length=1000)  # 10 seconds at 100Hz
-    elif model_type.lower() == "cnn_lstm":
-        model = CNNLSTMModel(sequence_length=1000)
-    else:
-        raise ValueError(f"Unknown model type: {model_type}")
-    
+    model = CNNLSTMModel(sequence_length=1000)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.to(device)
     model.eval()
@@ -510,14 +198,6 @@ def load_model(model_path, model_type="transformer", device=None):
 def predict_ecg(model, ecg_signal, device=None):
     """
     Make a prediction on an ECG signal.
-    
-    Args:
-        model (torch.nn.Module): Trained model
-        ecg_signal (numpy.ndarray): ECG signal with shape (sequence_length, 12)
-        device (torch.device): Device to run inference on
-        
-    Returns:
-        dict: Prediction results including probability and class
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -544,13 +224,6 @@ def predict_ecg(model, ecg_signal, device=None):
 def visualize_detections(image, detections):
     """
     Visualize the detected ECG leads on the image.
-    
-    Args:
-        image: ECG image
-        detections (list): List of detection dictionaries
-        
-    Returns:
-        numpy.ndarray: Visualization image
     """
     height, width = image.shape[:2]
     
@@ -580,13 +253,6 @@ def visualize_detections(image, detections):
 def plot_ecg_signals(signals, fs=100):
     """
     Plot ECG signals.
-    
-    Args:
-        signals (numpy.ndarray): ECG signals with shape (samples, leads)
-        fs (int): Sampling frequency
-        
-    Returns:
-        matplotlib.figure.Figure: Figure with plotted signals
     """
     lead_names = ['I', 'II', 'III', 'aVR', 'aVL', 'aVF', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6']
     num_leads = signals.shape[1]
@@ -614,7 +280,7 @@ def plot_ecg_signals(signals, fs=100):
     plt.tight_layout()
     return fig
 
-def process_ecg_image(uploaded_file, yolo_model_path, ml_model_path, model_type='cnn_lstm'):
+def process_ecg_image(uploaded_file):
     """Process the uploaded ECG image and make a prediction"""
     
     # Create a temporary file
@@ -632,7 +298,7 @@ def process_ecg_image(uploaded_file, yolo_model_path, ml_model_path, model_type=
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # Load YOLO model
-        yolo_model = YOLO(yolo_model_path)
+        yolo_model = YOLO(YOLO_MODEL_PATH)
         
         # Step 1: Detect ECG leads
         detections = detect_ecg_leads(image, yolo_model)
@@ -649,7 +315,7 @@ def process_ecg_image(uploaded_file, yolo_model_path, ml_model_path, model_type=
         signals, fs = resample_to_ptb_xl_format(lead_signals)
         
         # Step 4: Load ML model
-        ml_model = load_model(ml_model_path, model_type, device)
+        ml_model = load_model(ML_MODEL_PATH, device)
         
         # Step 5: Make prediction
         result = predict_ecg(ml_model, signals, device)
@@ -680,37 +346,25 @@ def process_ecg_image(uploaded_file, yolo_model_path, ml_model_path, model_type=
 # Main Streamlit app
 def main():
     st.set_page_config(
-        page_title="ECG Digitization and MI Prediction",
+        page_title="PulseGuard: ECG MI Detection",
         page_icon="❤️",
         layout="wide"
     )
     
-    st.title("PulseGaurd: Protecting Hearts, One Scan At a Time")
+    # Header with logo and title
+    col1, col2 = st.columns([1, 5])
+    
+    # You can add a logo here if you have one
+    # with col1:
+    #     st.image("logo.png", width=100)
+    
+    with col2:
+        st.title("PulseGuard: Protecting Hearts, One Scan At a Time")
+    
     st.markdown("""
-    This app allows you to upload an ECG image and:
-    1. Digitize the ECG signals
-    2. Predict whether the ECG shows myocardial infarction (MI)
+    This application analyzes ECG images to detect myocardial infarction (MI).
+    Upload an ECG image to get started.
     """)
-    
-    # Sidebar
-    st.sidebar.title("Configuration")
-    
-    # Model paths
-    yolo_model_path = st.sidebar.text_input(
-        "YOLOv8 Model Path",
-        value="path/to/yolo/model.pt"
-    )
-    
-    ml_model_path = st.sidebar.text_input(
-        "ML Model Path",
-        value="path/to/ml/model.pt"
-    )
-    
-    model_type = st.sidebar.selectbox(
-        "Model Type",
-        options=["transformer", "cnn_lstm"],
-        index=1  # Default to CNN-LSTM
-    )
     
     # File uploader
     uploaded_file = st.file_uploader("Upload an ECG image", type=["jpg", "jpeg", "png"])
@@ -722,15 +376,10 @@ def main():
         st.image(original_image, caption="Uploaded ECG Image", use_column_width=True)
         
         # Process button
-        if st.button("Process ECG"):
+        if st.button("Analyze ECG"):
             with st.spinner("Processing ECG image..."):
                 # Process the image
-                result = process_ecg_image(
-                    uploaded_file,
-                    yolo_model_path,
-                    ml_model_path,
-                    model_type
-                )
+                result = process_ecg_image(uploaded_file)
                 
                 if result["success"]:
                     # Create two columns
@@ -752,14 +401,58 @@ def main():
                         fig = plot_ecg_signals(result["signals"], result["fs"])
                         st.pyplot(fig)
                     
-                    # Display prediction
-                    st.subheader("Prediction Result")
-                    if result["prediction"] == "MI":
-                        st.error(f"Prediction: **{result['prediction']}** (Myocardial Infarction)")
-                    else:
-                        st.success(f"Prediction: **{result['prediction']}** (Normal)")
+                    # Display prediction with more detailed information
+                    st.subheader("Analysis Result")
+                    
+                    # Use columns for prediction display
+                    pred_col1, pred_col2 = st.columns([1, 2])
+                    
+                    with pred_col1:
+                        # Display a gauge or probability meter
+                        if result["prediction"] == "MI":
+                            st.error(f"Diagnosis: **Myocardial Infarction (MI)**")
+                            st.metric("MI Probability", f"{result['probability']*100:.1f}%")
+                        else:
+                            st.success(f"Diagnosis: **Normal ECG**")
+                            st.metric("Normal Probability", f"{(1-result['probability'])*100:.1f}%")
+                    
+                    with pred_col2:
+                        # Display additional information or recommendations
+                        if result["prediction"] == "MI":
+                            st.markdown("""
+                            ### Findings
+                            The analysis indicates signs of myocardial infarction. This suggests possible heart muscle damage 
+                            due to reduced blood flow.
+                            
+                            ### Recommendations
+                            - Immediate medical attention is advised
+                            - This is an automated analysis and should be confirmed by a medical professional
+                            """)
+                        else:
+                            st.markdown("""
+                            ### Findings
+                            No significant signs of myocardial infarction detected in the ECG.
+                            
+                            ### Note
+                            - This is an automated analysis and should be confirmed by a medical professional
+                            - Regular cardiac check-ups are still recommended
+                            """)
                 else:
                     st.error(f"Error: {result['error']}")
+                    st.markdown("""
+                    ### Troubleshooting Tips:
+                    - Ensure the uploaded image is a clear ECG scan
+                    - Check that the image contains standard ECG leads (I, II, III, aVR, aVL, aVF, V1-V6)
+                    - Try uploading a different ECG image
+                    """)
+    
+    # Add footer
+    st.markdown("---")
+    st.markdown("""
+    <div style="text-align: center">
+        <p>PulseGuard ECG Analysis System | Not for clinical use | © 2025</p>
+    </div>
+    """, unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
